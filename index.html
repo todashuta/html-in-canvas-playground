@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+	<meta charset="utf-8">
+	<title>HTML-in-Canvas spike（Babylon.js HtmlTexture）</title>
+	<style>
+		/* 実験用の最小スタイル。このファイル内に全部そろえてある（外部 CSS は読まない） */
+		body { margin: 0; background: #0b1020; color: #dfe7ff; font: 13px/1.7 "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; }
+		#renderCanvas { display: block; width: 100vw; height: 100vh; }
+		.side {
+			position: fixed; top: 12px; left: 12px; z-index: 5;
+			max-width: 380px; padding: 12px 16px; border-radius: 10px;
+			background: rgba(10, 14, 30, .85); border: 1px solid rgba(120, 150, 255, .35);
+		}
+		.side h2 { margin: 0 0 8px; font-size: 14px; color: #9db4ff; }
+		.side .route { font-weight: bold; color: #ffd166; }
+		.side dl { margin: 0; }
+		.side dt { color: #8fa2cf; }
+		.side dd { margin: 0 0 4px; }
+		code { color: #8fd3ff; }
+	</style>
+</head>
+<body>
+	<!-- content="drawable" は HTML-in-Canvas 本体 API（Chrome 157+）での必須の目印。
+	     Babylon 9.33.2 はこの属性を canvas に付ける処理を内蔵していないため、ここで付けておく。
+	     古いブラウザでは未知の属性なので単に無視される。 -->
+	<canvas id="renderCanvas" content="drawable"></canvas>
+	<div class="side">
+		<h2>HTML-in-Canvas spike</h2>
+		<p>経路: <span class="route" id="hicRoute">判定中…</span></p>
+		<dl>
+			<dt>テクスチャ</dt><dd id="hicTexture">まだ作っていない</dd>
+			<dt>paint 発火</dt><dd id="hicPaint">0 回</dd>
+		</dl>
+		<p>3D のパネルは 1 枚の DOM でできている。ボタンは 3D 平面の上で押せる（クリックは <code>HtmlRaycastInteractionManager</code> が UV から画面座標へ直して DOM に送る）。</p>
+		<p>パン（右ドラッグ）とズーム（ホイール）でカメラを回して、DOM の像が 3D に張り付いていることを確かめられる。</p>
+	</div>
+	<script src="https://cdn.babylonjs.com/v9.33.2/babylon.js"></script>
+	<script>
+		"use strict";
+
+		/* ------------------------------------------------ ポリフィルの準備 */
+		/* ネイティブ API（Chrome 157+）が無いときは、three-html-render のポリフィルを試す。
+		 * それも無いときは、HtmlTexture の内蔵 SVG フォールバック（静的なスナップショット）に落ちる。
+		 * 失敗はこのデモを止めない（CDN に届かなければ fallback で続行する）。 */
+		const hasNativeHic = "captureElementImage" in HTMLCanvasElement.prototype;
+		const ensureHtmlInCanvasAsync = hasNativeHic
+			? Promise.resolve()
+			: new Promise((resolve, reject) => {
+				const script = document.createElement("script");
+				script.dataset.hicPolyfill = "";
+				script.onload = resolve;
+				script.onerror = () => reject(new Error("three-html-render のポリフィルを読めませんでした"));
+				script.src = "https://cdn.jsdelivr.net/npm/three-html-render@0.1.2/dist/polyfill.js";
+				document.head.appendChild(script);
+			}).catch(() => null);
+
+		/* ------------------------------------------------ デモの DOM パネル */
+		/* スタイルは全部 inline。SVG フォールバックは外部スタイルシートを読まず、
+		 * inline のスタイルだけをスナップショットに反映するため。 */
+		const panel = document.createElement("div");
+		panel.style.cssText = "width:640px;height:420px;padding:34px;box-sizing:border-box;background:#111a33;color:#fff;" +
+			"font:30px/1.6 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;text-align:center;position:relative;";
+		const panelTitle = document.createElement("div");
+		panelTitle.style.cssText = "font-size:34px;color:#9db4ff;";
+		panelTitle.textContent = "DOM のパネル";
+		const panelCount = document.createElement("div");
+		panelCount.style.cssText = "margin:18px 0;font-size:52px;font-weight:bold;color:#ffd166;";
+		panelCount.textContent = "0";
+		const panelSub = document.createElement("div");
+		panelSub.style.cssText = "font-size:20px;color:#8fa2cf;";
+		panelSub.textContent = "3D 上のボタンで動く";
+		/* 色はこの順でローテーションする。「色を変える」を押すたびに +1 する */
+		const panelColors = ["#111a33", "#232b47", "#3c1c40", "#1b2f2a", "#2a2440"];
+		let tint = 0;
+		const panelButtonRow = document.createElement("div");
+		panelButtonRow.style.cssText = "display:flex;gap:18px;justify-content:center;margin-top:26px;";
+		const makeButton = (label, color) => {
+			const btn = document.createElement("button");
+			btn.style.cssText = "padding:12px 26px;border:2px solid rgba(255,255,255,.35);border-radius:10px;" +
+				"background:" + color + ";color:#fff;font-size:24px;cursor:pointer;";
+			btn.textContent = label;
+			return btn;
+		};
+		const panelPlus = makeButton("+1", "#2f6fed");
+		const panelFlip = makeButton("色を変える", "#9b3aed");
+		panelButtonRow.className = "row";
+		panelButtonRow.append(panelPlus, panelFlip);
+		panel.append(panelTitle, panelCount, panelSub, panelButtonRow);
+		document.body.appendChild(panel);   // 可視化はしない（canvas 内に居る間は fallback content として描画されない）
+
+		const applyPanelTint = () => {
+			panel.style.background = panelColors[tint % panelColors.length];
+		};
+
+		/* ------------------------------------------------ シーン */
+		const engine = new BABYLON.Engine(document.getElementById("renderCanvas"), true);
+		const scene = new BABYLON.Scene(engine);
+		const camera = new BABYLON.ArcRotateCamera("cam", -Math.PI / 2, 1.05, 22, BABYLON.Vector3.Zero(), scene);
+		camera.attachControl(document.getElementById("renderCanvas"), true);
+		new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
+		const box = BABYLON.MeshBuilder.CreateBox("box", { size: 6 }, scene);
+		box.position.set(-8, 0, 0);
+		const boxMat = new BABYLON.StandardMaterial("boxMat", scene);
+		boxMat.diffuseColor = new BABYLON.Color3(0.9, 0.35, 0.35);
+		box.material = boxMat;
+
+		/* パネル平面。テクスチャの縦横比（640:420）と面の縦横比をそろえる。カメラの前に置いて、
+		 * 毎フレームカメラを向くように回す（ArcRotate で回してもパネルが自分に向いて見える） */
+		const plane = BABYLON.MeshBuilder.CreatePlane("panelPlane", { width: 12 * 640 / 420, height: 12 }, scene);
+		plane.position.set(8, 0, 0);
+		const planeMat = new BABYLON.StandardMaterial("panelMat", scene);
+		/* 像が載るまでの間も平面が居ることが分かるように、emissive に薄い色を出しておく。
+		 * emissiveTexture を付けると emissiveColor は使われなくなる（像優先）ので、
+		 * 紐付けは像が載ってから（onLoad）にする。 */
+		planeMat.emissiveColor = new BABYLON.Color3(0.22, 0.24, 0.34);
+		planeMat.disableLighting = true;
+		planeMat.backFaceCulling = false;   // 像の向きは lookAt の補正で合わせるので、どちらの面も消さない
+		plane.material = planeMat;
+		/* CreatePlane の front face は -Z 方向を向く。lookAt の補正 (Math.PI) で front face をカメラへ向ける。
+		 * 補正を付けないとカメラから見て背面になるため、backFaceCulling の既定で平面ごと消える。 */
+		scene.onBeforeRenderObservable.add(() => plane.lookAt(camera.position, Math.PI));
+
+		/* ------------------------------------------------ 本体: HtmlTexture */
+		ensureHtmlInCanvasAsync.then(async () => {
+			const mode = ("captureElementImage" in HTMLCanvasElement.prototype)
+				? (hasNativeHic ? "native（本体 API）" : "polyfill（three-html-render）")
+				: "SVG フォールバック（静的）";
+			document.getElementById("hicRoute").textContent = mode;
+			const textureEl = document.getElementById("hicTexture");
+
+			/* ネイティブ経路では最初の upload が paint イベントを待つ。発火が有るかを
+			 * 画面に出しておく（paint が一度も来ない場合の最初の手がかりになる）。 */
+			let paintCount = 0;
+			const paintEl = document.getElementById("hicPaint");
+			engine.getRenderingCanvas().addEventListener("paint", () => {
+				paintCount += 1;
+				paintEl.textContent = paintCount + " 回";
+			});
+
+			const htmlTexture = new BABYLON.HtmlTexture("panelTex", panel, {
+				scene,
+				width: 640,
+				height: 420,
+				autoUpdate: true,
+			});
+			/* planeMat への紐付けは像が載ってから（onLoad）。像が無い段階で紐付けると、
+			 * emissiveTexture 優先で emissiveColor が使われなくなり、平面が真っ黒になる */
+
+			/* ポインタの受け渡し。3D 平面のクリックを DOM のボタンへ直す。 */
+			new BABYLON.HtmlRaycastInteractionManager(scene, htmlTexture, plane);
+
+			/* DOM 側の動き。fallback のときは像が自動更新されないので update() を明示する。
+			 * native / polyfill では autoUpdate が描画の更新を追うが、呼んでも余計なものは増えない。 */
+			const refresh = () => htmlTexture.update();
+			panelPlus.addEventListener("click", () => {
+				panelCount.textContent = String((Number(panelCount.textContent) || 0) + 1);
+				refresh();
+			});
+			panelFlip.addEventListener("click", () => {
+				tint += 1;
+				applyPanelTint();
+				refresh();
+			});
+
+			textureEl.textContent = "作りました（像の準備を待っている）";
+			htmlTexture.onLoadObservable.addOnce(() => {
+				// 像 (texture) が載ったので、ここで材質へ紐づける (linking)。emissiveColor は像の邪魔にならないよう黒へ
+				planeMat.emissiveColor = BABYLON.Color3.Black();
+				planeMat.emissiveTexture = htmlTexture;
+				textureEl.textContent = "像が載りました";
+				/* 像の左上の画素を読んで、何が貼れているかを画面に残す */
+				Promise.resolve(htmlTexture.readPixels()).then((pixels) => {
+					if (!pixels) { textureEl.textContent += "（readPixels=(なし)）"; return; }
+					const d = pixels instanceof Uint8Array ? pixels : new Uint8Array(pixels);
+					textureEl.textContent += " （画素 RGB=" + d[0] + "," + d[1] + "," + d[2] + "）";
+				}).catch((e) => {
+					textureEl.textContent += "（readPixels 失敗: " + e + "）";
+				});
+			});
+
+			console.log("[hic] route=" + mode + " nativeBefore=" + hasNativeHic);
+
+			/* ?selftest が付いたときだけ動く自己確認。テクスチャへの像の載り方と、
+			 * update() による差し替えを console に出す。SVG フォールバックの動作を、
+			 * 本体 API の無い環境でも確かめるための入口。 */
+			const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+			const showPixel = async (label) => {
+				try {
+					const pixels = await htmlTexture.readPixels();
+					if (!pixels) { console.log("[hic] " + label + " readPixels=(なし)"); return; }
+					const d = pixels instanceof Uint8Array ? pixels : new Uint8Array(pixels);
+					console.log("[hic] " + label + " 画素[0] RGBA=" + d[0] + "," + d[1] + "," + d[2] + "," + d[3]);
+				} catch (e) {
+					console.log("[hic] " + label + " readPixels 失敗: " + e);
+				}
+			};
+			if (new URLSearchParams(location.search).has("selftest")) {
+				/* Observable は直接 await しない（環境により thenable とは限らない）。Promise で包んでおく */
+				await Promise.race([
+					new Promise((r) => htmlTexture.onLoadObservable.addOnce(r)),
+					wait(9000).then(() => { throw new Error("onLoad が 9 秒で来ませんでした"); }),
+				]);
+				await showPixel("初回");
+				panelCount.textContent = "1";
+				panelFlip.click();                              // DOM だけ動かした状態
+				refresh();
+				await wait(500);                                // 像の再描画をまつ
+				await showPixel("update 後");
+				console.log("[hic] selftest DONE count=" + panelCount.textContent + " tint=" + tint);
+			}
+		});
+
+		engine.runRenderLoop(() => scene.render());
+		window.addEventListener("resize", () => engine.resize());
+	</script>
+</body>
+</html>
